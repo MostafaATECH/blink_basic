@@ -1,0 +1,21 @@
+#include <zephyr/dt-bindings/pinctrl/stm32-pinctrl.h>
+
+/ {
+	aliases {
+		led0 = &blue_led_1; 	// This is LED1 as labeled STM32WL55JC board's 
+		//led0 = &green_led_2; 	// This is LED2 as labeled STM32WL55JC board's 
+		led1 = &red_led_3; 	// This is LED3 as labeled STM32WL55JC board's 
+	};
+};
+
+/*
+ * The NUCLEO-WL55JC board definition already routes I2C2 to
+ * PA12 (SCL) and PA11 (SDA) and enables the controller.
+ */
+&i2c2 {
+	mpu6050: mpu6050@68 {
+		compatible = "invensense,mpu6050";
+		reg = <0x68>;
+		status = "okay";
+	};
+};

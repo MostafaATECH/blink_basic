@@ -1,0 +1,15 @@
+# Generated build output and caches
+build/
+.zephyr-cache/
+
+# Local Python environment and bytecode
+.venv*/
+__pycache__/
+*.py[cod]
+
+# Editor and local-only files
+.vscode/
+*.code-workspace
+Fast.txt
+*.zip
+
