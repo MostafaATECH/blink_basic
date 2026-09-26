@@ -53,6 +53,7 @@ class SharedState:
         self._connection = "Starting"
         self._connection_ok = False
         self._firmware_message = "Waiting for STM32 status..."
+        self._calibration = "Waiting for calibration"
         self._valid_rows = 0
         self._bad_rows = 0
 
@@ -61,12 +62,28 @@ class SharedState:
             changed = message != self._connection
             self._connection = message
             self._connection_ok = ok
+            if not ok:
+                self._calibration = "Waiting for calibration"
+                self._sample = None
+                self._sample_received_at = 0.0
         if changed:
             print(f"SERIAL STATUS | {message}", flush=True)
 
     def set_firmware_message(self, message: str) -> None:
         with self._lock:
             self._firmware_message = message
+            if message.startswith(("Hold the IMU still", "Calibration:")):
+                self._calibration = "Calibrating - hold still"
+                self._sample = None
+                self._sample_received_at = 0.0
+            elif message.startswith("Motion detected"):
+                self._calibration = "Motion detected - retrying"
+            elif message.startswith("Calibration read failed"):
+                self._calibration = "Sensor read failed - retrying"
+            elif message.startswith("Calibration accepted"):
+                self._calibration = "Calibration complete"
+            elif message.startswith("ERROR:"):
+                self._calibration = "Sensor error"
         print(f"STM32 STATUS  | {message}", flush=True)
 
     def publish(self, sample: ImuSample) -> None:
@@ -74,21 +91,21 @@ class SharedState:
             self._sample = sample
             self._sample_received_at = wall_time.monotonic()
             self._valid_rows += 1
+            # DATA is emitted only after successful startup calibration.
+            self._calibration = "Calibration complete"
 
     def record_bad_row(self) -> None:
         with self._lock:
             self._bad_rows += 1
 
-    def snapshot(self) -> tuple[ImuSample | None, float, str, bool, str, int, int]:
+    def snapshot(self) -> tuple[ImuSample | None, float, str, bool, str]:
         with self._lock:
             return (
                 self._sample,
                 self._sample_received_at,
                 self._connection,
                 self._connection_ok,
-                self._firmware_message,
-                self._valid_rows,
-                self._bad_rows,
+                self._calibration,
             )
 
 
@@ -132,6 +149,8 @@ class SerialReader(threading.Thread):
             self.state.set_connection(f"Connecting to {self.port} at {self.baud} baud...", False)
             try:
                 with serial.Serial(self.port, self.baud, timeout=0.25) as connection:
+                    # Drop bytes buffered before connection (possibly old firmware).
+                    connection.reset_input_buffer()
                     self.state.set_connection(f"Connected to {self.port}", True)
                     self._read_lines(connection)
             except (serial.SerialException, OSError) as exc:
@@ -252,7 +271,7 @@ def run_visualizer(port: str, state: SharedState, reader: SerialReader) -> None:
     window.fps_counter.enabled = True
 
     # The drone is intentionally built only from Ursina's basic primitives.
-    drone = Entity(position=(0.8, 0.2, 2.5))
+    drone = Entity(position=(1.5, 0.2, 2.5))
     Entity(parent=drone, model="cube", color=color.azure, scale=(1.7, 0.28, 0.9))
     Entity(parent=drone, model="cube", color=color.dark_gray, scale=(4.2, 0.10, 0.16), rotation_y=35)
     Entity(parent=drone, model="cube", color=color.dark_gray, scale=(4.2, 0.10, 0.16), rotation_y=-35)
@@ -271,26 +290,16 @@ def run_visualizer(port: str, state: SharedState, reader: SerialReader) -> None:
     AmbientLight(color=color.rgba(120, 120, 120, 0.35))
     sun = DirectionalLight(color=color.rgba(255, 245, 225, 0.9))
     sun.look_at(Vec3(1, -1, 1))
-    camera.position = (0.8, 3.4, -10)
-    camera.look_at(drone)
+    camera.position = (0, 3.4, -10)
+    camera.look_at(Vec3(0.25, 0.2, 2.5))
 
-    status_text = Text(parent=camera.ui, x=-0.87, y=0.47, origin=(-0.5, 0.5), scale=0.85,
-                       background=True)
-    angles_text = Text(parent=camera.ui, x=-0.87, y=0.31, origin=(-0.5, 0.5), scale=1.05,
-                       color=color.azure, background=True)
-    raw_text = Text(parent=camera.ui, x=-0.87, y=0.04, origin=(-0.5, 0.5), scale=0.82,
-                    color=color.white, background=True)
-    processed_text = Text(parent=camera.ui, x=0.20, y=0.04, origin=(-0.5, 0.5), scale=0.82,
-                          color=color.lime, background=True)
-    note_text = Text(
-        parent=camera.ui,
-        text="Orange = front | Red = rear | ESC quits | Yaw is relative and will drift",
-        x=-0.87,
-        y=-0.46,
-        origin=(-0.5, -0.5),
-        scale=0.78,
-        color=color.light_gray,
-    )
+    # One fixed panel keeps all demo values together and away from the drone.
+    Entity(parent=camera.ui, model="quad", position=(-0.54, 0, 1),
+           scale=(0.70, 0.88), color=color.rgba(12, 22, 35, 235))
+    status_text = Text(parent=camera.ui, x=-0.83, y=0.39, origin=(-0.5, 0.5),
+                       scale=0.85, color=color.lime)
+    angles_text = Text(parent=camera.ui, x=-0.83, y=0.13, origin=(-0.5, 0.5),
+                       scale=0.90, color=color.azure)
 
     class VisualizerController(Entity):
         def __init__(self) -> None:
@@ -309,43 +318,40 @@ def run_visualizer(port: str, state: SharedState, reader: SerialReader) -> None:
                 received_at,
                 connection,
                 connection_ok,
-                firmware_message,
-                valid_rows,
-                bad_rows,
+                calibration,
             ) = state.snapshot()
             now = wall_time.monotonic()
             age = now - received_at if received_at else math.inf
 
             if not connection_ok:
-                shown_status = connection
+                shown_status = f"{port}: disconnected/connecting"
                 status_color = color.red
             elif sample is None:
-                if now - self.started_at < 3.0:
-                    shown_status = f"{connection}; waiting for STM32 startup"
+                calibrating = calibration.startswith(("Calibrating", "Motion detected",
+                                                       "Sensor read failed"))
+                if now - self.started_at < 6.0 or calibrating:
+                    shown_status = f"{port}: waiting for data"
                 else:
-                    shown_status = f"{connection}; no serial data - flash/reset the STM32"
+                    shown_status = f"ALERT: {port} has no data"
                 status_color = color.orange
             elif age > STALE_AFTER_S:
-                shown_status = f"{connection}; DATA stream is stale"
-                status_color = color.orange
+                shown_status = f"ALERT: {port} data stopped"
+                status_color = color.red
             else:
-                shown_status = f"{connection}; live ({age * 1000:.0f} ms old)"
+                shown_status = f"{port} live ({age * 1000:.0f} ms old)"
                 status_color = color.lime
 
             status_text.text = (
-                f"CONNECTION: {shown_status}\n"
-                f"Rows: {valid_rows} valid, {bad_rows} discarded\n"
-                f"STM32: {firmware_message[:100]}"
+                "CONNECTION\n"
+                f"{shown_status}\n\n"
+                "CALIBRATION\n"
+                f"{calibration}"
             )
             status_text.color = status_color
 
             if sample is None:
-                angles_text.text = (
-                    "NO DATA RECEIVED\n"
-                    "Flash the current IMU_DEMO firmware, then press RESET on the Nucleo.\n"
-                    "Keep the IMU still during the 2.5-second calibration."
-                )
-                if now >= self.next_no_data_notice:
+                angles_text.text = "ANGLES (deg)\nWaiting for STM32 data"
+                if connection_ok and now >= self.next_no_data_notice:
                     print(
                         "NO DATA | COM port is open, but the STM32 sent no bytes. "
                         "Flash IMU_DEMO, press RESET, and keep the IMU still.",
@@ -365,27 +371,17 @@ def run_visualizer(port: str, state: SharedState, reader: SerialReader) -> None:
             self.display_pitch = smooth_angle(self.display_pitch, sample.pitch, blend)
             self.display_yaw = smooth_angle(self.display_yaw, sample.yaw_relative, blend)
 
-            # Ursina axes: pitch about X, yaw about Y, and roll about Z.
-            drone.rotation_x = self.display_pitch
+            # Swap and reverse the drone's roll/pitch display; yaw stays unchanged.
+            drone.rotation_x = -self.display_roll
             drone.rotation_y = -self.display_yaw
-            drone.rotation_z = -self.display_roll
+            drone.rotation_z = self.display_pitch
 
-            bias = tuple(raw - calibrated for raw, calibrated in zip(sample.gyro_raw, sample.gyro_cal))
             angles_text.text = (
-                "FUSED ORIENTATION\n"
-                f"Roll {sample.roll:8.2f} deg   Pitch {sample.pitch:8.2f} deg\n"
-                f"Relative yaw (drifting) {sample.yaw_relative:8.2f} deg"
-            )
-            raw_text.text = (
-                "RAW / DIRECT SENSOR VALUES\n"
-                f"Accel m/s^2\n  {format_xyz(sample.accel)}\n"
-                f"Gyro raw deg/s\n  {format_xyz(sample.gyro_raw)}"
-            )
-            processed_text.text = (
-                "CALIBRATED / FUSED RESULTS\n"
-                f"Estimated gyro bias deg/s\n  {format_xyz(bias)}\n"
-                f"Gyro calibrated deg/s\n  {format_xyz(sample.gyro_cal)}\n"
-                f"Fused R/P deg  R={sample.roll:7.2f}  P={sample.pitch:7.2f}"
+                "ANGLES (deg)\n"
+                f"Roll X    {sample.roll:+8.2f}\n"
+                f"Pitch Y   {sample.pitch:+8.2f}\n"
+                f"Yaw Z     {sample.yaw_relative:+8.2f}\n"
+                "Yaw is relative; drifts"
             )
 
             if now >= self.next_terminal_print:

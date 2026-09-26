@@ -259,6 +259,7 @@ int main(void)
 		row.angle[1] = alpha * (row.angle[1] + row.gyro[1] * dt) +
 			(1 - alpha) * accel_pitch;
 		row.angle[2] += row.gyro[2] * dt;
+
 		row.time_ms = now_us / 1000; /* Time since boot, not nominal sample count. */
 
 		/* Send every second sample: about 50 rows/s from 100 samples/s. */
